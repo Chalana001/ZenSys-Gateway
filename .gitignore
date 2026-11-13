@@ -1,0 +1,56 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Coverage
+coverage.out
+coverage.html
+*.cover
+
+# Environment and secrets.
+# Never commit a DSN, a service token, or anything holding one.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Deployment-specific configuration. gateway.dev.yaml and
+# gateway.example.yaml are committed; real deployment configs are not.
+configs/gateway.yaml
+configs/gateway.local.yaml
+configs/*.local.yaml
+
+# The end-to-end probe harness is committed; what it generates is not.
+configs/.probe/*.yaml
+configs/.probe/*.log
+configs/.probe/*.txt
+configs/.probe/*.body
+
+# Local database state from the dev compose stack
+/data/
+*.sqlite
+*.sqlite3
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

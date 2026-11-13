@@ -1,0 +1,229 @@
+# ZenSys Gateway — annotated configuration reference.
+#
+# Copy to configs/gateway.yaml (or a deployment-specific name) and pass it with
+#   gateway -config /etc/zensys/gateway.yaml
+#
+# Secrets are NEVER written here. The file names the environment variables that
+# hold them, and the Gateway resolves them at startup. A missing or empty
+# variable is a startup failure, never a silent empty credential.
+#
+# Unknown keys are rejected, not ignored: a typo such as "trusted_proxys" would
+# otherwise silently leave the default in place and look like it worked.
+
+server:
+  # Public listener. Receives all tenant traffic via the edge (Cloudflare →
+  # Nginx → here).
+  public_addr: "0.0.0.0:8080"
+
+  # Internal listener. Carries /healthz, /readyz, /metrics, and the tenant
+  # lifecycle API. It MUST be a loopback or private address — binding it to
+  # 0.0.0.0 is rejected at startup, because that would expose tenant lifecycle
+  # mutations to the internet. It must also differ from public_addr.
+  internal_addr: "127.0.0.1:8081"
+
+  read_header_timeout: 5s
+  idle_timeout: 60s
+  shutdown_grace: 15s
+
+  # Bounds on what an untrusted client can make the Gateway buffer.
+  #
+  # max_header_bytes is the policy limit on the header block, which includes
+  # the request line. The Gateway answers an over-limit block with a 431 in its
+  # error contract, and logs it.
+  #
+  # net/http enforces a hard cap of its own at max_header_bytes + 4096 (the
+  # extra 4096 is net/http's own "bufio slop"), and above that cap it answers a
+  # bare text 431 written straight to the connection, before any Gateway code
+  # runs. That refusal is therefore neither shaped by the error contract nor
+  # logged, and it cannot be fixed from inside the process. Treat this value as
+  # the limit you are enforcing and the extra 4 KiB as a margin that exists
+  # below the floor.
+  max_header_bytes: 65536
+
+  # A declared Content-Length over this is refused with a 413 before the
+  # request is routed or any upstream is dialled. A chunked body declares no
+  # length, so it is caught while being read instead, and mapped to the same
+  # 413.
+  max_body_bytes: 10485760
+
+platform:
+  # The bare apex domain. A hostname is only considered for tenant routing if
+  # it is exactly one label below this. "zensys.lk" is matched by exact
+  # equality and is never interpreted as tenant "zensys".
+  root_domain: "zensys.lk"
+
+  # What the apex itself does:
+  #   "landing"   → serve landing_dir/index.html
+  #   "not_found" → 404
+  # Every other reserved host returns 404 regardless.
+  apex_behavior: "landing"
+  landing_dir: "./configs/landing"
+
+  # Optional additions to the reserved-hostname list. The authoritative list is
+  # compiled into internal/tenant/reserved.go and cannot be removed or
+  # truncated by configuration — that list protects hostnames such as "admin"
+  # and "api" from ever becoming customer tenants, and a config file that could
+  # empty it would be a silent security hole. Entries here can only add.
+  reserved_hosts_extra: []
+
+registry:
+  # V1 supports "mysql" only.
+  driver: "mysql"
+
+  # Name of the environment variable holding the DSN, for example:
+  #   ZENSYS_REGISTRY_DSN='user:pass@tcp(host:3306)/zensys_gateway?parseTime=true'
+  # The DSN is never logged and never appears in an error message.
+  dsn_env: "ZENSYS_REGISTRY_DSN"
+
+  max_open_conns: 20
+  max_idle_conns: 10
+  conn_max_lifetime: 5m
+  query_timeout: 2s
+
+cache:
+  # How long a resolved route is trusted before it is re-read from the
+  # registry. The cache is an optimisation, never the source of truth: the
+  # Gateway must remain correct with an empty cache.
+  route_ttl: 60s
+
+  # How long a "no such tenant" result is remembered. Kept short so that a
+  # newly registered tenant becomes routable quickly.
+  negative_ttl: 30s
+
+  max_entries: 10000
+
+products:
+  # Upstreams are product-level, never tenant-level. There is deliberately no
+  # way to give one tenant its own upstream: tenant-specific infrastructure
+  # configuration must not leak into the routing core.
+  POS:
+    frontend_upstream: "http://10.0.0.11:3001"
+    backend_upstream: "http://10.0.0.11:8082"
+    upstream_timeout: 30s
+
+    # POS resolves tenants from X-Tenant-ID with host fallback, so the Gateway
+    # supplies the canonical tenant in that header.
+    inject_tenant_header: true
+    tenant_header_name: "X-Tenant-ID"
+
+  GMS:
+    frontend_upstream: "http://10.0.0.12:3002"
+    backend_upstream: "http://10.0.0.12:8083"
+    upstream_timeout: 30s
+
+    # GMS resolves tenants from the Host header. The Gateway always preserves
+    # the public host; this setting only controls whether the extra header is
+    # also sent.
+    inject_tenant_header: true
+    tenant_header_name: "X-Tenant-ID"
+
+routing:
+  # /api and /api/* are backend traffic; everything else is frontend traffic.
+  # The prefix is forwarded unchanged — the Gateway never strips or rewrites
+  # it, so it stays ignorant of downstream route internals.
+  backend_path_prefix: "/api"
+
+  # HTTP paths are case-sensitive, and both products declare lowercase routes.
+  # Leaving this true means /API/orders is treated as frontend traffic and
+  # returns the SPA rather than reaching a backend that has no such route.
+  path_prefix_case_sensitive: true
+
+proxy:
+  # Preserving the public host is what lets host-bound product tenancy work.
+  # GMS depends on it.
+  preserve_host: true
+
+  request_id_header: "X-Request-ID"
+
+  # Only requests arriving from these networks have their X-Forwarded-* headers
+  # trusted. Anything else has them discarded and replaced, so a client cannot
+  # forge its own origin. Accepts CIDR notation or a bare IP.
+  #
+  # EVERY hop between the client and the Gateway must be listed here. The
+  # resolved client address is the rightmost X-Forwarded-For entry that is not
+  # itself trusted, so a hop that is missing from this list becomes the client
+  # address — and therefore the tier-1 rate-limit key. With Cloudflare in front
+  # of Nginx, omitting Cloudflare's published ranges makes every visitor key on
+  # the Cloudflare edge that served them, so those visitors share one rate-limit
+  # bucket. That failure is silent: routing is unaffected, because routing never
+  # reads a forwarded header.
+  #
+  # Leaving this list empty is valid and means "trust nothing": every request
+  # is attributed to its immediate peer. The Gateway logs a warning at startup
+  # when the list is empty, because a typo here looks the same as a deliberate
+  # choice.
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "::1/128"
+    - "10.0.0.0/8"
+
+  upstream_response_header_timeout: 30s
+
+internal_auth:
+  # "token" is implemented in V1.
+  # "mtls" is recognised but not implemented, and causes a startup failure
+  # rather than silently running without authentication. The authenticator is
+  # behind an interface, so adding mTLS later requires no change to handlers or
+  # authorization logic.
+  mode: "token"
+
+  tokens:
+    # Each token identifies a calling service and the products it may manage.
+    # A POS token cannot touch a GMS tenant, and vice versa.
+    - service: "pos"
+      token_env: "ZENSYS_TOKEN_POS"
+      may_manage_products: ["POS"]
+
+    - service: "gms"
+      token_env: "ZENSYS_TOKEN_GMS"
+      may_manage_products: ["GMS"]
+
+rate_limit:
+  # Applies to the public listener only. The internal listener carries the
+  # tenant lifecycle API, whose callers are authenticated platform services on
+  # a loopback address, so a limit there would turn a legitimate bulk
+  # provisioning run into what looks like a bug.
+  #
+  # /healthz, /readyz, and /metrics are exempt on both listeners. A liveness
+  # probe refused for being too frequent reports the service as dead, and an
+  # orchestrator that restarts on a failed probe turns a load spike into an
+  # outage.
+  enabled: true
+
+  # Tier 1, keyed by client IP, applied before any tenant lookup. Absorbs
+  # abuse aimed at unknown hostnames without reaching the registry.
+  #
+  # "Client IP" means the address resolved through the trusted_proxies policy
+  # above, not the socket address — behind a proxy every request arrives from
+  # the proxy, so keying on the socket would put all clients in one bucket.
+  ip:
+    rps: 200
+    burst: 400
+
+  # Tier 2, keyed by tenant, applied after resolution. Enforces fairness so one
+  # noisy tenant cannot starve its neighbours.
+  tenant:
+    rps: 50
+    burst: 100
+
+  # Bounds the number of distinct keys each tier remembers, per tier. The keys
+  # are chosen by whoever is sending requests, so an unbounded table would be a
+  # memory exhaustion vector: this is a limit, not a tuning hint.
+  #
+  # An entry whose bucket has fully refilled is dropped first, since it is
+  # indistinguishable from an entry that does not exist. Only when a shard is
+  # full of live entries is the least recently seen one evicted, which does
+  # discard a real client's state. Raise this above the number of distinct
+  # clients you expect within one refill period (burst / rps seconds).
+  max_entries: 4096
+
+observability:
+  log_level: "info"
+  log_format: "json"
+
+  metrics_enabled: true
+
+  # Serving /healthz and /readyz on the public listener too. Left false because
+  # the public listener is a host-based catch-all: a health endpoint there
+  # would shadow a path a product may legitimately own on {tenant}.zensys.lk.
+  health_on_public: false
